@@ -173,11 +173,6 @@ class UserStates(StatesGroup):
     # === НОВЫЕ СОСТОЯНИЯ ===
     waiting_for_snoser_target = State()
     waiting_for_narko_target = State()
-    
-    # === TIDA STATES ===
-    waiting_for_tida_target = State()
-    waiting_for_tida_reason = State()
-    waiting_for_tida_confirm = State()
 
 import logging
 
@@ -196,8 +191,6 @@ main_dp.include_router(router)
 # Очереди и глобальные переменные
 au_report_queue = asyncio.Queue()
 au_report_busy = False
-tida_report_queue = asyncio.Queue()
-tida_report_busy = False
 active_mirrors = {} # Словарь для хранения запущенных зеркал: {token: {"task": Task, "bot": Bot}}
 
 # --- СИСТЕМА БАЗЫ ДАННЫХ (TXT) ---
@@ -423,47 +416,31 @@ async def stop_mirror_bot(token: str):
             logger.error(f"Ошибка при остановке зеркала: {e}")
 
 async def load_all_mirrors():
-    """Загружает зеркала из БД и запускает каждое в отдельном потоке (поллинг)"""
+    """Загружает зеркала из БД и запускает каждое последовательно в одном потоке"""
     global all_bot_usernames
     users = await get_users()
     bots_to_poll = []
     
-    async def load_and_start_single_mirror(uid, token):
-        """Загружает одно зеркало и сразу запускает его поллинг в отдельной задаче"""
-        if not token or token in active_mirrors:
-            return None
-        
-        mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-        try:
-            await mirror_bot.get_me()  # Проверка валидности
-            # Запускаем поллинг для этого зеркала в отдельном потоке
-            task = asyncio.create_task(main_dp.start_polling(mirror_bot))
-            active_mirrors[token] = {"task": task, "bot": mirror_bot}
-            logger.info(f"✅ Зеркало для пользователя {uid} запущено в отдельном потоке")
-            return mirror_bot
-        except TelegramUnauthorizedError:
-            logger.warning(f"❌ Unauthorized токен зеркала: {token[:15]}... Удаляем.")
-            await remove_invalid_token(token)
-            await mirror_bot.session.close()
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка подготовки зеркала {token[:15]}...: {e}")
-            await mirror_bot.session.close()
-            return None
-    
-    # Создаем задачи для всех зеркал - каждое будет запущено в отдельном потоке
-    tasks = []
     for uid, data in users.items():
         for token in data.get('tokens', []):
-            tasks.append(load_and_start_single_mirror(uid, token))
-    
-    # Запускаем все зеркала параллельно
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Собираем успешные результаты
-    for result in results:
-        if result and not isinstance(result, Exception):
-            bots_to_poll.append(result)
+            if not token or token in active_mirrors:
+                continue
+            
+            mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+            try:
+                await mirror_bot.get_me()  # Проверка валидности
+                # Запускаем поллинг для этого зеркала в том же потоке
+                task = asyncio.create_task(main_dp.start_polling(mirror_bot))
+                active_mirrors[token] = {"task": task, "bot": mirror_bot}
+                bots_to_poll.append(mirror_bot)
+                logger.info(f"✅ Зеркало для пользователя {uid} запущено")
+            except TelegramUnauthorizedError:
+                logger.warning(f"❌ Unauthorized токен зеркала: {token[:15]}... Удаляем.")
+                await remove_invalid_token(token)
+                await mirror_bot.session.close()
+            except Exception as e:
+                logger.error(f"Ошибка подготовки зеркала {token[:15]}...: {e}")
+                await mirror_bot.session.close()
     
     return bots_to_poll
 
@@ -742,83 +719,6 @@ async def au_report_worker():
             au_report_queue.task_done()
         await asyncio.sleep(1)
 
-async def tida_report_worker():
-    global tida_report_busy
-    
-    # Прокси для TIDA (SOCKS5) - используем правильный формат для Telethon
-    # Прокси 45.4.199.190:8000 с авторизацией xNtH1M:psMu4u
-    TIDA_PROXY = {
-        'proxy_type': 'socks5',
-        'hostname': '45.4.199.190',
-        'port': 8000,
-        'username': 'xNtH1M',
-        'password': 'psMu4u'
-    }
-    
-    while True:
-        if not tida_report_busy and not tida_report_queue.empty():
-            tida_report_busy = True
-            user_id, target_link, reason_text, source_bot_token = await tida_report_queue.get()
-            
-            # Используем сессию из папки TIDA_report
-            session_path = "TIDA_report/TIDA_report.session"
-            session_name = "TIDA_report.session"
-            bot_obj = get_current_bot(source_bot_token)
-            
-            if not os.path.exists(session_path):
-                await bot_obj.send_message(user_id, "❌ Ошибка: Сессия TIDA_report/TIDA_report.session не найдена.")
-            else:
-                client = TelegramClient(
-                    session_path.replace('.session', ''), 
-                    API_ID, 
-                    API_HASH,
-                    proxy=TIDA_PROXY,
-                    connection=ConnectionTcpFull
-                )
-                try:
-                    # Принудительное подключение
-                    await client.connect()
-                    if not await client.is_user_authorized():
-                        await bot_obj.send_message(user_id, "❌ Ошибка: TIDA сессия не авторизована.")
-                    else:
-                        await bot_obj.send_message(user_id, f"🔄 TIDA Report запущен для {target_link}...")
-                        
-                        # Команды боту @TIDABot
-                        await send_au_message(client, "#старт", 0.5)
-                        await send_au_message(client, "/start", 1)
-                        await send_au_message(client, target_link, 2)
-                        await send_au_message(client, "Non-consensual intimate image sharing", 2)
-                        await send_au_message(client, reason_text, 2)
-                        await send_au_message(client, "Proceed without documentation", 2)
-                        await send_au_message(client, "Confirm", 2)
-                        await send_au_message(client, "#стоп", 1)
-                        
-                        await bot_obj.send_message(user_id, f"✅ Жалоба на {target_link} отправлена!")
-                        await add_report_stat(user_id)
-                        
-                        # Логирование в топик AU (16) или можно создать отдельный
-                        log_text = (
-                            f"🛡 <b>TIDA Report Отправлен</b>\n\n"
-                            f"👤 Пользователь ID: <code>{user_id}</code>\n"
-                            f"🔗 Ссылка: {target_link}\n"
-                            f"💬 Текст жалобы: <i>{reason_text}</i>\n"
-                            f"📁 Сессия: {session_name}"
-                        )
-                        await send_log("au_report", log_text)
-                        
-                except Exception as e:
-                    logger.error(f"TIDA Worker error: {e}")
-                    await bot_obj.send_message(user_id, f"❌ Ошибка TIDA: {e}")
-                finally:
-                    try:
-                        await client.disconnect()
-                    except:
-                        pass
-            
-            tida_report_busy = False
-            tida_report_queue.task_done()
-        await asyncio.sleep(1)
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -904,9 +804,8 @@ async def func_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="[👻] Sns Deleter", callback_data="sn_start")],
         [InlineKeyboardButton(text="[💊] Drug Deleter", callback_data="pv_start")],
         [InlineKeyboardButton(text="[🔈] AU", callback_data="au_start")],
-        [InlineKeyboardButton(text="[🔈] TIDA", callback_data="tida_start")],
         [InlineKeyboardButton(text="[✉️] Mail method", callback_data="email_start")],
-        [InlineKeyboardButton(text="[📄] Telegraph Deleter", callback_data="telegraph_start")],  # ← НОВАЯ КНОПКА
+        [InlineKeyboardButton(text="[📄] Telegraph Deleter", callback_data="telegraph_start")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]
     ])
     if call.message.photo:
@@ -1558,63 +1457,6 @@ async def au_confirm_yes(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(UserStates.waiting_for_au_confirm, F.data == "au_confirm_no")
 async def au_confirm_no(call: CallbackQuery, state: FSMContext):
-    await call.message.edit_text("❌ Отправка жалобы отменена.")
-    await state.clear()
-
-# === TIDA REPORT ===
-@router.callback_query(F.data == "tida_start")
-async def tida_start(call: CallbackQuery, state: FSMContext):
-    if call.message.photo:
-        await call.message.edit_caption(caption="Введите ссылку (t.me/username или @username):")
-    else:
-        await call.message.edit_text("Введите ссылку (t.me/username или @username):")
-    await state.set_state(UserStates.waiting_for_tida_target)
-
-@router.message(UserStates.waiting_for_tida_target)
-async def tida_target(message: Message, state: FSMContext):
-    target = message.text.strip()
-    
-    if target.startswith("@"):
-        target = f"t.me/{target[1:]}"
-    elif target.startswith("https://t.me/"):
-        target = target.replace("https://", "")
-    elif target.startswith("http://t.me/"):
-        target = target.replace("http://", "")
-
-    await state.update_data(target=target)
-    await message.answer(f"✅ Принято: <b>{target}</b>\n\n📝 Введите текст жалобы:")
-    await state.set_state(UserStates.waiting_for_tida_reason)
-
-@router.message(UserStates.waiting_for_tida_reason)
-async def tida_reason(message: Message, state: FSMContext):
-    await state.update_data(reason=message.text)
-    data = await state.get_data()
-    
-    confirm_text = (
-        f"🎯 <b>Цель:</b> {data['target']}\n"
-        f"📝 <b>Жалоба:</b> {data['reason']}\n\n"
-        f"❓ <b>Отправить эту жалобу в очередь?</b>"
-    )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да", callback_data="tida_confirm_yes"),
-         InlineKeyboardButton(text="❌ Нет", callback_data="tida_confirm_no")]
-    ])
-    
-    await message.answer(confirm_text, reply_markup=kb)
-    await state.set_state(UserStates.waiting_for_tida_confirm)
-
-@router.callback_query(UserStates.waiting_for_tida_confirm, F.data == "tida_confirm_yes")
-async def tida_confirm_yes(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    # Передаем также токен бота, чтобы воркер знал, с какого бота отправлять ответ
-    async with report_queue_lock:
-        await tida_report_queue.put((call.from_user.id, data['target'], data['reason'], call.bot.token))
-    await call.message.edit_text("🚀 Успешно! Добавлено в очередь TIDA Report.")
-    await state.clear()
-
-@router.callback_query(UserStates.waiting_for_tida_confirm, F.data == "tida_confirm_no")
-async def tida_confirm_no(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("❌ Отправка жалобы отменена.")
     await state.clear()
 
